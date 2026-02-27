@@ -20,7 +20,7 @@ app.use(cors())
 app.use(express.json())
 
 // MongoDB 连接
-const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/chip-platform'
+const MONGODB_URI = process.env.MONGO_URI || 'mongodb://localhost:27017/chip-platform'
 
 mongoose.connect(MONGODB_URI)
   .then(() => console.log('MongoDB connected'))
