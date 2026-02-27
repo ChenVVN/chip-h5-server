@@ -2,7 +2,9 @@
   "$schema": "https://railway.app/schema.json",
   "build": {
     "builder": "NIXPACKS_V1",
-    "node": "22"
+    "install": {
+      "override": false
+    }
   },
   "deploy": {
     "numReplicas": 1,
