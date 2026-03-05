@@ -20,7 +20,7 @@ app.use(cors())
 app.use(express.json())
 
 // MongoDB 连接
-const MONGODB_URI = process.env.MONGO_URI || 'mongodb://localhost:27017/chip-platform'
+const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/chip-platform'
 
 mongoose.connect(MONGODB_URI)
   .then(() => console.log('MongoDB connected'))
@@ -108,7 +108,91 @@ app.post('/api/rooms', async (req, res) => {
   }
 })
 
-// 获取或更新房间内成员资料
+// 加入房间
+app.post('/api/rooms/join', async (req, res) => {
+  try {
+    const { roomCode, odid, nickname, avatar } = req.body
+    const room = await Room.findOne({ roomCode })
+    if (!room) {
+      return res.status(404).json({ success: false, error: '房间不存在' })
+    }
+    if (room.members.length >= 20) {
+      return res.status(400).json({ success: false, error: '房间已满' })
+    }
+    const isInRoom = room.members.some(m => m.odid === odid)
+    if (!isInRoom) {
+      room.members.push({ odid, nickname, avatar, personalScore: 0 })
+      // 添加加入日志
+      room.logs.unshift({
+        action: '加入',
+        odid,
+        nickname,
+        amount: 0,
+        timestamp: new Date()
+      })
+      await room.save()
+      // 广播新用户加入
+      io.to(room.roomCode).emit('roomUpdate', room)
+    }
+    res.json({ success: true, data: room })
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message })
+  }
+})
+
+// 重新加入房间（返回房间）
+app.post('/api/rooms/rejoin', async (req, res) => {
+  try {
+    const { roomCode, odid, nickname, avatar } = req.body
+    const room = await Room.findOne({ roomCode })
+    if (!room) {
+      return res.status(404).json({ success: false, error: '房间不存在' })
+    }
+    const isInRoom = room.members.some(m => m.odid === odid)
+    if (!isInRoom) {
+      // 从离开记录中查找该用户离开时的积分
+      let lastScore = 0
+      for (const log of room.logs) {
+        if (log.odid === odid && log.action === '离开') {
+          lastScore = log.amount || 0
+          break // 找到最近的离开记录
+        }
+      }
+      
+      // 恢复该用户离开时的积分
+      room.members.push({ odid, nickname, avatar, personalScore: lastScore })
+      // 添加返回日志
+      room.logs.unshift({
+        action: '返回',
+        odid,
+        nickname,
+        amount: 0,
+        timestamp: new Date()
+      })
+      await room.save()
+      // 广播
+      io.to(room.roomCode).emit('roomUpdate', room)
+    }
+    res.json({ success: true, data: room })
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message })
+  }
+})
+
+// 获取房间信息
+app.get('/api/rooms/:roomCode', async (req, res) => {
+  try {
+    const room = await Room.findOne({ roomCode: req.params.roomCode })
+    if (!room) {
+      return res.status(404).json({ success: false, error: '房间不存在' })
+    }
+    res.json({ success: true, data: room })
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message })
+  }
+})
+
+// 更新房间内成员信息
 app.post('/api/rooms/:roomId/updateMember', async (req, res) => {
   try {
     const { odid, nickname, avatar } = req.body
@@ -124,57 +208,7 @@ app.post('/api/rooms/:roomId/updateMember', async (req, res) => {
     if (nickname) member.nickname = nickname
     if (avatar) member.avatar = avatar
     await room.save()
-    // 广播成员资料更新
-    io.to(room.roomCode).emit('memberUpdate', {
-      odid,
-      nickname: member.nickname,
-      avatar: member.avatar
-    })
-    res.json({ success: true, data: room })
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message })
-  }
-})
-
-// 加入房间
-app.post('/api/rooms/join', async (req, res) => {
-  try {
-    const { roomCode, odid, nickname, avatar } = req.body
-    const room = await Room.findOne({ roomCode })
-    if (!room) {
-      return res.status(404).json({ success: false, error: '房间不存在' })
-    }
-    if (room.members.length >= 20) {
-      return res.status(400).json({ success: false, error: '房间已满' })
-    }
-    const existingMember = room.members.find(m => m.odid === odid)
-    const isReturning = !!existingMember
-    
-    if (!isReturning) {
-      room.members.push({ odid, nickname, avatar, personalScore: 0 })
-      // 添加加入日志
-      room.logs.unshift({
-        action: '加入',
-        odid,
-        nickname,
-        amount: 0,
-        timestamp: new Date()
-      })
-    } else {
-      // 更新成员信息（返回房间时同步最新信息）
-      if (nickname) existingMember.nickname = nickname
-      if (avatar) existingMember.avatar = avatar
-      // 添加返回房间日志
-      room.logs.unshift({
-        action: '返回',
-        odid,
-        nickname: existingMember.nickname,
-        amount: 0,
-        timestamp: new Date()
-      })
-    }
-    await room.save()
-    // 广播新用户加入
+    // 广播更新
     io.to(room.roomCode).emit('roomUpdate', room)
     res.json({ success: true, data: room })
   } catch (err) {
@@ -182,13 +216,33 @@ app.post('/api/rooms/join', async (req, res) => {
   }
 })
 
-// 获取房间信息
-app.get('/api/rooms/:roomCode', async (req, res) => {
+// 离开房间
+app.post('/api/rooms/:roomId/leave', async (req, res) => {
   try {
-    const room = await Room.findOne({ roomCode: req.params.roomCode })
+    const { odid, nickname } = req.body
+    const room = await Room.findById(req.params.roomId)
     if (!room) {
       return res.status(404).json({ success: false, error: '房间不存在' })
     }
+    const idx = room.members.findIndex(m => m.odid === odid)
+    if (idx === -1) {
+      return res.status(400).json({ success: false, error: '成员不存在' })
+    }
+    // 记录离开时的积分
+    const leaveScore = room.members[idx].personalScore
+    // 添加离开记录，amount 保存当时的积分
+    room.logs.unshift({
+      action: '离开',
+      odid,
+      nickname,
+      amount: leaveScore, // 保存当时的积分
+      timestamp: new Date()
+    })
+    // 移除成员
+    room.members.splice(idx, 1)
+    await room.save()
+    // 广播更新
+    io.to(room.roomCode).emit('roomUpdate', room)
     res.json({ success: true, data: room })
   } catch (err) {
     res.status(500).json({ success: false, error: err.message })
