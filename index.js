@@ -9,14 +9,15 @@ dotenv.config()
 
 const app = express()
 const httpServer = createServer(app)
+const corsOrigin = process.env.CORS_ORIGIN || '*'
 const io = new Server(httpServer, {
   cors: {
-    origin: '*',
+    origin: corsOrigin,
     methods: ['GET', 'POST']
   }
 })
 
-app.use(cors())
+app.use(cors({ origin: corsOrigin }))
 app.use(express.json())
 
 // MongoDB 连接
@@ -150,18 +151,15 @@ app.post('/api/rooms/rejoin', async (req, res) => {
     }
     const isInRoom = room.members.some(m => m.odid === odid)
     if (!isInRoom) {
-      // 从离开记录中查找该用户离开时的积分
       let lastScore = 0
       for (const log of room.logs) {
         if (log.odid === odid && log.action === '离开') {
           lastScore = log.amount || 0
-          break // 找到最近的离开记录
+          break
         }
       }
-      
-      // 恢复该用户离开时的积分
+
       room.members.push({ odid, nickname, avatar, personalScore: lastScore })
-      // 添加返回日志
       room.logs.unshift({
         action: '返回',
         odid,
@@ -170,7 +168,6 @@ app.post('/api/rooms/rejoin', async (req, res) => {
         timestamp: new Date()
       })
       await room.save()
-      // 广播
       io.to(room.roomCode).emit('roomUpdate', room)
     }
     res.json({ success: true, data: room })
@@ -204,11 +201,9 @@ app.post('/api/rooms/:roomId/updateMember', async (req, res) => {
     if (!member) {
       return res.status(400).json({ success: false, error: '成员不存在' })
     }
-    // 更新成员信息
     if (nickname) member.nickname = nickname
     if (avatar) member.avatar = avatar
     await room.save()
-    // 广播更新
     io.to(room.roomCode).emit('roomUpdate', room)
     res.json({ success: true, data: room })
   } catch (err) {
@@ -228,20 +223,16 @@ app.post('/api/rooms/:roomId/leave', async (req, res) => {
     if (idx === -1) {
       return res.status(400).json({ success: false, error: '成员不存在' })
     }
-    // 记录离开时的积分
     const leaveScore = room.members[idx].personalScore
-    // 添加离开记录，amount 保存当时的积分
     room.logs.unshift({
       action: '离开',
       odid,
       nickname,
-      amount: leaveScore, // 保存当时的积分
+      amount: leaveScore,
       timestamp: new Date()
     })
-    // 移除成员
     room.members.splice(idx, 1)
     await room.save()
-    // 广播更新
     io.to(room.roomCode).emit('roomUpdate', room)
     res.json({ success: true, data: room })
   } catch (err) {
