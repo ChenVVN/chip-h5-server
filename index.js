@@ -4,28 +4,235 @@ import { Server } from 'socket.io'
 import cors from 'cors'
 import mongoose from 'mongoose'
 import dotenv from 'dotenv'
+import path from 'node:path'
+import { promises as fs } from 'node:fs'
+import crypto from 'node:crypto'
+import { fileURLToPath } from 'node:url'
 
 dotenv.config()
 
 const app = express()
 const httpServer = createServer(app)
-const corsOrigin = process.env.CORS_ORIGIN || '*'
+const __filename = fileURLToPath(import.meta.url)
+const __dirname = path.dirname(__filename)
+const uploadsDir = path.join(__dirname, 'uploads')
+const avatarUploadsDir = path.join(uploadsDir, 'avatars')
+const avatarPublicPath = '/uploads/avatars'
+
+app.set('trust proxy', true)
+
+function parseCorsOrigins(value) {
+  if (!value || value === '*') return '*'
+  return value
+    .split(',')
+    .map(item => item.trim())
+    .filter(Boolean)
+}
+
+const corsOrigins = parseCorsOrigins(
+  process.env.CORS_ORIGIN || 'https://cwnchip.top,https://www.cwnchip.top,http://127.0.0.1:4173,http://localhost:4173'
+)
+
+function isAllowedOrigin(origin) {
+  if (corsOrigins === '*') return true
+  if (!origin) return true
+  return corsOrigins.includes(origin)
+}
+
+function corsOriginHandler(origin, callback) {
+  if (isAllowedOrigin(origin)) {
+    callback(null, true)
+    return
+  }
+
+  callback(new Error(`CORS origin not allowed: ${origin}`))
+}
+
 const io = new Server(httpServer, {
   cors: {
-    origin: corsOrigin,
+    origin: corsOriginHandler,
     methods: ['GET', 'POST']
   }
 })
 
-app.use(cors({ origin: corsOrigin }))
-app.use(express.json())
+app.use(cors({ origin: corsOriginHandler, credentials: false }))
+app.use(express.json({ limit: '2mb' }))
+app.use('/uploads', express.static(uploadsDir))
 
 // MongoDB 连接
 const MONGODB_URI = process.env.MONGO_URI || process.env.MONGODB_URI || 'mongodb://localhost:27017/chip-platform'
+let useMemoryStore = process.env.USE_MEMORY_STORE === '1'
+let storageModeReady = Promise.resolve()
 
-mongoose.connect(MONGODB_URI)
-  .then(() => console.log('MongoDB connected'))
-  .catch(err => console.error('MongoDB connection error:', err))
+const memoryUsers = new Map()
+const memoryRooms = new Map()
+
+if (!useMemoryStore) {
+  storageModeReady = mongoose.connect(MONGODB_URI, {
+    serverSelectionTimeoutMS: 2000
+  })
+    .then(() => console.log('MongoDB connected'))
+    .catch(err => {
+      useMemoryStore = true
+      console.error('MongoDB connection error:', err)
+      console.log('Falling back to in-memory storage for local development')
+    })
+} else {
+  console.log('Using in-memory storage')
+}
+
+async function ensureStorageMode() {
+  await storageModeReady
+}
+
+function createMemoryId(prefix) {
+  return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`
+}
+
+function normalizeMemoryUser(user) {
+  return {
+    _id: user._id || createMemoryId('user'),
+    odid: user.odid,
+    nickname: user.nickname || '',
+    avatar: user.avatar || '',
+    createdAt: user.createdAt || new Date()
+  }
+}
+
+function normalizeMemoryRoom(room) {
+  return {
+    _id: room._id || createMemoryId('room'),
+    roomCode: room.roomCode,
+    roomName: room.roomName,
+    ownerId: room.ownerId,
+    deskScore: room.deskScore || 0,
+    members: (room.members || []).map(member => ({
+      odid: member.odid,
+      nickname: member.nickname || '',
+      avatar: member.avatar || '',
+      personalScore: member.personalScore || 0
+    })),
+    logs: (room.logs || []).map(log => ({
+      action: log.action,
+      odid: log.odid,
+      nickname: log.nickname || '',
+      amount: log.amount || 0,
+      timestamp: log.timestamp || new Date()
+    })),
+    createdAt: room.createdAt || new Date(),
+    expireAt: room.expireAt || null
+  }
+}
+
+function saveMemoryUser(user) {
+  const normalized = normalizeMemoryUser(user)
+  memoryUsers.set(normalized.odid, normalized)
+  return normalized
+}
+
+function saveMemoryRoom(room) {
+  const normalized = normalizeMemoryRoom(room)
+  memoryRooms.set(normalized._id, normalized)
+  return normalized
+}
+
+function findMemoryUserByOdid(odid) {
+  return memoryUsers.get(odid) || null
+}
+
+function findMemoryRoomByCode(roomCode) {
+  for (const room of memoryRooms.values()) {
+    if (room.roomCode === roomCode) return room
+  }
+  return null
+}
+
+function findMemoryRoomById(roomId) {
+  return memoryRooms.get(roomId) || null
+}
+
+async function ensureUploadDirs() {
+  await fs.mkdir(avatarUploadsDir, { recursive: true })
+}
+
+function getAssetBaseUrl(req) {
+  if (process.env.PUBLIC_BASE_URL) {
+    return process.env.PUBLIC_BASE_URL.replace(/\/$/, '')
+  }
+  return `${req.protocol}://${req.get('host')}`
+}
+
+function toAbsoluteAvatarUrl(req, avatarPath) {
+  if (!avatarPath) return ''
+  if (/^https?:\/\//i.test(avatarPath) || avatarPath.startsWith('data:image/')) {
+    return avatarPath
+  }
+  return `${getAssetBaseUrl(req)}${avatarPath.startsWith('/') ? avatarPath : `/${avatarPath}`}`
+}
+
+function extractLocalUploadPath(avatarUrl) {
+  if (!avatarUrl) return null
+  try {
+    const parsed = new URL(avatarUrl)
+    if (parsed.pathname.startsWith(`${avatarPublicPath}/`)) {
+      return path.join(uploadsDir, parsed.pathname.replace(/^\/uploads\//, ''))
+    }
+  } catch {
+    if (avatarUrl.startsWith(`${avatarPublicPath}/`)) {
+      return path.join(uploadsDir, avatarUrl.replace(/^\/uploads\//, ''))
+    }
+  }
+  return null
+}
+
+async function removeLocalAvatarFile(avatarUrl) {
+  const filePath = extractLocalUploadPath(avatarUrl)
+  if (!filePath) return
+  try {
+    await fs.unlink(filePath)
+  } catch (err) {
+    if (err.code !== 'ENOENT') {
+      console.error('Failed to remove old avatar file:', err)
+    }
+  }
+}
+
+async function persistAvatar(req, avatar, previousAvatar = '') {
+  if (!avatar || !avatar.startsWith('data:image/')) {
+    return toAbsoluteAvatarUrl(req, avatar)
+  }
+
+  const match = avatar.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/)
+  if (!match) {
+    throw new Error('头像格式不正确')
+  }
+
+  const [, mimeType, base64Data] = match
+  const extension = mimeType.split('/')[1]?.replace('jpeg', 'jpg') || 'jpg'
+  const fileName = `${Date.now()}-${crypto.randomUUID()}.${extension}`
+  const relativePath = `${avatarPublicPath}/${fileName}`
+  const absolutePath = path.join(avatarUploadsDir, fileName)
+
+  await ensureUploadDirs()
+  await fs.writeFile(absolutePath, Buffer.from(base64Data, 'base64'))
+
+  if (previousAvatar && previousAvatar !== avatar) {
+    await removeLocalAvatarFile(previousAvatar)
+  }
+
+  return toAbsoluteAvatarUrl(req, relativePath)
+}
+
+app.get('/api/health', (req, res) => {
+  res.json({
+    success: true,
+    data: {
+      status: 'ok',
+      time: new Date().toISOString(),
+      storage: useMemoryStore ? 'memory' : 'mongodb'
+    }
+  })
+})
 
 // 数据模型
 const UserSchema = new mongoose.Schema({
@@ -69,14 +276,33 @@ function generateRoomCode() {
 // 获取或创建用户
 app.post('/api/user', async (req, res) => {
   try {
+    await ensureStorageMode()
     const { odid, nickname, avatar } = req.body
+    if (useMemoryStore) {
+      const existingUser = findMemoryUserByOdid(odid)
+      const savedAvatar = avatar !== undefined
+        ? await persistAvatar(req, avatar, existingUser?.avatar || '')
+        : (existingUser?.avatar || '')
+      const user = saveMemoryUser({
+        ...(existingUser || {}),
+        odid,
+        nickname: nickname ?? existingUser?.nickname ?? '',
+        avatar: savedAvatar
+      })
+      return res.json({ success: true, data: user })
+    }
+
     let user = await User.findOne({ odid })
     if (user) {
-      if (nickname) user.nickname = nickname
-      if (avatar) user.avatar = avatar
+      if (nickname !== undefined) user.nickname = nickname
+      if (avatar !== undefined) user.avatar = await persistAvatar(req, avatar, user.avatar || '')
       await user.save()
     } else {
-      user = await User.create({ odid, nickname, avatar })
+      user = await User.create({
+        odid,
+        nickname,
+        avatar: await persistAvatar(req, avatar)
+      })
     }
     res.json({ success: true, data: user })
   } catch (err) {
@@ -87,9 +313,10 @@ app.post('/api/user', async (req, res) => {
 // 创建房间
 app.post('/api/rooms', async (req, res) => {
   try {
+    await ensureStorageMode()
     const { ownerId, ownerName, ownerAvatar } = req.body
     const roomCode = generateRoomCode()
-    const room = await Room.create({
+    const roomPayload = {
       roomCode,
       roomName: `房间${roomCode}`,
       ownerId,
@@ -102,7 +329,12 @@ app.post('/api/rooms', async (req, res) => {
       }],
       logs: [],
       expireAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000)
-    })
+    }
+
+    const room = useMemoryStore
+      ? saveMemoryRoom(roomPayload)
+      : await Room.create(roomPayload)
+
     res.json({ success: true, data: room })
   } catch (err) {
     res.status(500).json({ success: false, error: err.message })
@@ -112,8 +344,11 @@ app.post('/api/rooms', async (req, res) => {
 // 加入房间
 app.post('/api/rooms/join', async (req, res) => {
   try {
+    await ensureStorageMode()
     const { roomCode, odid, nickname, avatar } = req.body
-    const room = await Room.findOne({ roomCode })
+    const room = useMemoryStore
+      ? findMemoryRoomByCode(roomCode)
+      : await Room.findOne({ roomCode })
     if (!room) {
       return res.status(404).json({ success: false, error: '房间不存在' })
     }
@@ -131,7 +366,11 @@ app.post('/api/rooms/join', async (req, res) => {
         amount: 0,
         timestamp: new Date()
       })
-      await room.save()
+      if (useMemoryStore) {
+        saveMemoryRoom(room)
+      } else {
+        await room.save()
+      }
       // 广播新用户加入
       io.to(room.roomCode).emit('roomUpdate', room)
     }
@@ -144,8 +383,11 @@ app.post('/api/rooms/join', async (req, res) => {
 // 重新加入房间（返回房间）
 app.post('/api/rooms/rejoin', async (req, res) => {
   try {
+    await ensureStorageMode()
     const { roomCode, odid, nickname, avatar } = req.body
-    const room = await Room.findOne({ roomCode })
+    const room = useMemoryStore
+      ? findMemoryRoomByCode(roomCode)
+      : await Room.findOne({ roomCode })
     if (!room) {
       return res.status(404).json({ success: false, error: '房间不存在' })
     }
@@ -167,7 +409,11 @@ app.post('/api/rooms/rejoin', async (req, res) => {
         amount: 0,
         timestamp: new Date()
       })
-      await room.save()
+      if (useMemoryStore) {
+        saveMemoryRoom(room)
+      } else {
+        await room.save()
+      }
       io.to(room.roomCode).emit('roomUpdate', room)
     }
     res.json({ success: true, data: room })
@@ -179,7 +425,10 @@ app.post('/api/rooms/rejoin', async (req, res) => {
 // 获取房间信息
 app.get('/api/rooms/:roomCode', async (req, res) => {
   try {
-    const room = await Room.findOne({ roomCode: req.params.roomCode })
+    await ensureStorageMode()
+    const room = useMemoryStore
+      ? findMemoryRoomByCode(req.params.roomCode)
+      : await Room.findOne({ roomCode: req.params.roomCode })
     if (!room) {
       return res.status(404).json({ success: false, error: '房间不存在' })
     }
@@ -192,8 +441,11 @@ app.get('/api/rooms/:roomCode', async (req, res) => {
 // 更新房间内成员信息
 app.post('/api/rooms/:roomId/updateMember', async (req, res) => {
   try {
+    await ensureStorageMode()
     const { odid, nickname, avatar } = req.body
-    const room = await Room.findById(req.params.roomId)
+    const room = useMemoryStore
+      ? findMemoryRoomById(req.params.roomId)
+      : await Room.findById(req.params.roomId)
     if (!room) {
       return res.status(404).json({ success: false, error: '房间不存在' })
     }
@@ -201,9 +453,13 @@ app.post('/api/rooms/:roomId/updateMember', async (req, res) => {
     if (!member) {
       return res.status(400).json({ success: false, error: '成员不存在' })
     }
-    if (nickname) member.nickname = nickname
-    if (avatar) member.avatar = avatar
-    await room.save()
+    if (nickname !== undefined) member.nickname = nickname
+    if (avatar !== undefined) member.avatar = await persistAvatar(req, avatar, member.avatar || '')
+    if (useMemoryStore) {
+      saveMemoryRoom(room)
+    } else {
+      await room.save()
+    }
     io.to(room.roomCode).emit('roomUpdate', room)
     res.json({ success: true, data: room })
   } catch (err) {
@@ -214,8 +470,11 @@ app.post('/api/rooms/:roomId/updateMember', async (req, res) => {
 // 离开房间
 app.post('/api/rooms/:roomId/leave', async (req, res) => {
   try {
+    await ensureStorageMode()
     const { odid, nickname } = req.body
-    const room = await Room.findById(req.params.roomId)
+    const room = useMemoryStore
+      ? findMemoryRoomById(req.params.roomId)
+      : await Room.findById(req.params.roomId)
     if (!room) {
       return res.status(404).json({ success: false, error: '房间不存在' })
     }
@@ -232,7 +491,11 @@ app.post('/api/rooms/:roomId/leave', async (req, res) => {
       timestamp: new Date()
     })
     room.members.splice(idx, 1)
-    await room.save()
+    if (useMemoryStore) {
+      saveMemoryRoom(room)
+    } else {
+      await room.save()
+    }
     io.to(room.roomCode).emit('roomUpdate', room)
     res.json({ success: true, data: room })
   } catch (err) {
@@ -243,8 +506,11 @@ app.post('/api/rooms/:roomId/leave', async (req, res) => {
 // 支出积分
 app.post('/api/rooms/:roomId/spend', async (req, res) => {
   try {
+    await ensureStorageMode()
     const { odid, nickname, amount } = req.body
-    const room = await Room.findById(req.params.roomId)
+    const room = useMemoryStore
+      ? findMemoryRoomById(req.params.roomId)
+      : await Room.findById(req.params.roomId)
     if (!room) {
       return res.status(404).json({ success: false, error: '房间不存在' })
     }
@@ -262,7 +528,11 @@ app.post('/api/rooms/:roomId/spend', async (req, res) => {
       amount,
       timestamp: new Date()
     })
-    await room.save()
+    if (useMemoryStore) {
+      saveMemoryRoom(room)
+    } else {
+      await room.save()
+    }
     // 广播更新
     io.to(room.roomCode).emit('roomUpdate', room)
     res.json({ success: true, data: room })
@@ -274,8 +544,11 @@ app.post('/api/rooms/:roomId/spend', async (req, res) => {
 // 收回积分
 app.post('/api/rooms/:roomId/reclaim', async (req, res) => {
   try {
+    await ensureStorageMode()
     const { odid, nickname, amount } = req.body
-    const room = await Room.findById(req.params.roomId)
+    const room = useMemoryStore
+      ? findMemoryRoomById(req.params.roomId)
+      : await Room.findById(req.params.roomId)
     if (!room) {
       return res.status(404).json({ success: false, error: '房间不存在' })
     }
@@ -295,7 +568,11 @@ app.post('/api/rooms/:roomId/reclaim', async (req, res) => {
       amount,
       timestamp: new Date()
     })
-    await room.save()
+    if (useMemoryStore) {
+      saveMemoryRoom(room)
+    } else {
+      await room.save()
+    }
     // 广播更新
     io.to(room.roomCode).emit('roomUpdate', room)
     res.json({ success: true, data: room })
