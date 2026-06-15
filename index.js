@@ -105,6 +105,9 @@ function normalizeMemoryRoom(room) {
     roomCode: room.roomCode,
     roomName: room.roomName,
     ownerId: room.ownerId,
+    creatorId: room.creatorId || room.ownerId,
+    initialScore: room.initialScore || 0,
+    distributedMembers: room.distributedMembers || [],
     deskScore: room.deskScore || 0,
     members: (room.members || []).map(member => ({
       odid: member.odid,
@@ -117,6 +120,7 @@ function normalizeMemoryRoom(room) {
       odid: log.odid,
       nickname: log.nickname || '',
       amount: log.amount || 0,
+      memberNames: log.memberNames || [],
       timestamp: log.timestamp || new Date()
     })),
     createdAt: room.createdAt || new Date(),
@@ -246,6 +250,9 @@ const RoomSchema = new mongoose.Schema({
   roomCode: String,
   roomName: String,
   ownerId: String,
+  creatorId: String,
+  initialScore: { type: Number, default: 0 },
+  distributedMembers: [String],
   deskScore: { type: Number, default: 0 },
   members: [{
     odid: String,
@@ -254,10 +261,11 @@ const RoomSchema = new mongoose.Schema({
     personalScore: { type: Number, default: 0 }
   }],
   logs: [{
-    action: String, // '支出' 或 '收回' 或 '加入'
+    action: String,
     odid: String,
     nickname: String,
     amount: Number,
+    memberNames: [String],
     timestamp: { type: Date, default: Date.now }
   }],
   createdAt: { type: Date, default: Date.now },
@@ -320,6 +328,8 @@ app.post('/api/rooms', async (req, res) => {
       roomCode,
       roomName: `房间${roomCode}`,
       ownerId,
+      creatorId: ownerId,
+      initialScore: 0,
       deskScore: 0,
       members: [{
         odid: ownerId,
@@ -574,6 +584,67 @@ app.post('/api/rooms/:roomId/reclaim', async (req, res) => {
       await room.save()
     }
     // 广播更新
+    io.to(room.roomCode).emit('roomUpdate', room)
+    res.json({ success: true, data: room })
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message })
+  }
+})
+
+// 分配初始积分
+app.post('/api/rooms/:roomId/distribute', async (req, res) => {
+  try {
+    await ensureStorageMode()
+    const { operatorId, amount } = req.body
+    const room = useMemoryStore
+      ? findMemoryRoomById(req.params.roomId)
+      : await Room.findById(req.params.roomId)
+    if (!room) {
+      return res.status(404).json({ success: false, error: '房间不存在' })
+    }
+    if (room.creatorId !== operatorId) {
+      return res.status(403).json({ success: false, error: '仅群主可分配筹码' })
+    }
+
+    const distributeAmount = Number(amount) || 0
+    if (distributeAmount <= 0) {
+      return res.status(400).json({ success: false, error: '请输入有效的积分数额' })
+    }
+
+    // 筛选尚未领取初始积分的成员
+    const distributedSet = new Set(room.distributedMembers || [])
+    const newMembers = room.members.filter(m => !distributedSet.has(m.odid))
+
+    if (newMembers.length === 0) {
+      return res.status(400).json({ success: false, error: '所有成员已领取过初始积分' })
+    }
+
+    room.initialScore = distributeAmount
+
+    // 给未领取的成员发放初始积分
+    const distributedNames = []
+    for (const member of newMembers) {
+      member.personalScore = (member.personalScore || 0) + distributeAmount
+      distributedSet.add(member.odid)
+      distributedNames.push(member.nickname || '未命名')
+    }
+    room.distributedMembers = Array.from(distributedSet)
+
+    // 添加发放日志（记录成员名单）
+    room.logs.unshift({
+      action: '系统发放',
+      odid: '',
+      nickname: '系统',
+      amount: distributeAmount,
+      memberNames: distributedNames,
+      timestamp: new Date()
+    })
+
+    if (useMemoryStore) {
+      saveMemoryRoom(room)
+    } else {
+      await room.save()
+    }
     io.to(room.roomCode).emit('roomUpdate', room)
     res.json({ success: true, data: room })
   } catch (err) {
